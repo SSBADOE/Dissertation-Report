@@ -1,0 +1,697 @@
+---
+title: "R Notebook"
+author: '2049352'
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  word_document: default
+  pdf_document: default
+  html_document:
+    df_print: paged
+  html_notebook: default
+editor_options:
+  chunk_output_type: console
+---
+
+#The Aim of this Research work  is to develop an  Artificial Neural Network Algorithm that performs better and has the most accurate results in predicting NH4 load, which has a close relation with direct N2O emissions
+
+
+```{r}
+# load Packages
+
+library(xts)
+library(lubridate)
+library(robustbase)
+library(readr)
+library(rlist)
+library(zoo)
+library(imputeTS)
+library(wvtool)
+library(readr)
+library(neuralnet)
+library(kernlab)
+library(class)
+library(dlookr)
+library(dplyr)
+library(ggplot2)
+
+```
+
+# 1. Organise and clean the data
+
+```{r}
+########################## Input data ##################
+
+Spernal_new <- read_csv("Spernal_all_3.csv", 
+                        col_types = cols(TimeStamp = col_datetime(format = "%d/%m/%Y %H:%M")))
+
+
+View(Spernal_new)
+
+str(Spernal_new)
+
+dlookr::diagnose(Spernal_new)
+
+
+
+####################################################################################
+
+```
+
+
+```{r}
+#########     Online sensors  ##############################
+
+#timeseries<-seq(ymd_hm('2018-01-01 00:00'), ymd_hm('2018-12-02 23:45'), by = 'hour')
+time_index <- seq(from = as.POSIXct('2018-01-01 00:00'), 
+                  to = as.POSIXct('2018-12-02 23:45'), 
+                  by = "15 min")
+
+d_data<-as.POSIXct(Spernal_new$TimeStamp, "%Y-%m-%d %H:%M")
+
+xt_data <- xts(Spernal_new[,-1], 
+               order.by=d_data) # The 1:28902 define the rows with datetime for this variable
+
+xt_data <- xt_data[ ! duplicated( index(xt_data), fromLast = FALSE ),  ] ## remove duplicate datetimes
+
+
+storage.mode(xt_data) <- "numeric"
+
+xt_data_df<-as.data.frame(xt_data)
+
+
+xt_data<-as.xts(xt_data)
+
+summary(xt_data)
+
+
+```
+
+
+```{r}
+########## Isolate the days with 0 zero centrate
+
+daily_list<-split(xt_data[,c(8,9,18,21,22,31,44,45,15,16,17,14)], f="days")
+
+no_cent<-NULL
+for (i in 1:336){
+  df<-(daily_list[[i]])
+  sumcent<-sum(df$Centrate_flow, na.rm=TRUE)
+  if(sumcent==0){
+    no_cent<-rbind(no_cent, df)
+  }
+  df<-NULL
+}
+
+```
+
+
+```{r}
+########### Separate the different flows
+
+no_cent$RAS_m3_d<-no_cent$RAS_flow*60*60*24/1000/3
+
+no_cent$Storm_ret_flow_m3d<-no_cent$Storm_ret_flow*60*60*24/1000
+no_cent$Storm.flow_3pg_m3d<-no_cent$Storm.flow_3pg*60*60*24*0.33/1000/3
+no_cent$FFT_flow_m3d<-no_cent$FFT_flow*1000*0.33/3
+no_cent$Ras_ind<-(no_cent$RAS_m3_d-no_cent$FFT_flow_m3d-no_cent$Storm.flow_3pg_m3d)/(no_cent$FFT_flow_m3d+no_cent$Storm.flow_3pg_m3d)
+no_cent$SAS_F_flow_m3d<-no_cent$SAS_F_flow*60*60*24/1000/3
+no_cent$SAS_F_density_mgl<-no_cent$SAS_F_density*10000
+no_cent$nh4_load<-no_cent$RAS_m3_d*no_cent$amm_in/1000
+
+no_cent$ras_real<-(no_cent$RAS_m3_d-no_cent$FFT_flow_m3d-no_cent$Storm.flow_3pg_m3d)
+
+
+```
+
+
+```{r}
+#### Decompose RAS into trend/seasonality and remainder
+
+no_cent_ts<- ts(no_cent$ras_real[385:1152,], frequency = 96)
+
+no_cent_ts[,1]<-na_locf(no_cent_ts[,1])
+dec<-stl(no_cent_ts[,1], na.action=na.pass, s.window ="periodic")
+plot(dec)
+
+dec<-as.data.frame(dec$time.series)
+dec$ras<-dec$seasonal+dec$trend
+plot(dec$ras, type="l")
+
+```
+
+
+```{r}
+######### smoothing RAS ######## 
+ras_filt<-rollmean(rollmean(rollmean(dec$ras, 5), 5),5)
+
+plot(ras_filt, type="l")
+plot(dec$ras[7:768], col="red", type="l")
+
+lines(ras_filt, col="green")
+
+ras_filt<-as.data.frame(ras_filt)
+add<-as.matrix(c(0,0,0,0,0,0))
+
+colnames(add)<-c("ras_filt")
+ras_filt<-rbind(add,ras_filt)
+
+
+
+ras_filt<-rbind(ras_filt,add)
+
+no_cent$weekday<-weekdays(index(no_cent))
+no_cent$weekday<-as.factor(no_cent$weekday)
+no_cent_subset<-no_cent[385:1152,]
+
+
+no_cent_subset$RAS_filet<-ras_filt[,1]
+no_cent_subset$RAS_filet[no_cent_subset$RAS_filet==0.0]<-no_cent_subset$ras_real  ##smoothed RAS
+
+```
+
+
+```{r}
+##Calculate NH4 load
+
+no_cent_subset_df<-as.data.frame(no_cent_subset)
+
+no_cent_subset_df$all_flow_in<-no_cent_subset_df$Storm.flow_3pg_m3d+no_cent_subset_df$FFT_flow_m3d
+
+no_cent_subset_df$nh4_load<-no_cent_subset_df$all_flow_in*no_cent_subset_df$amm_in/1000
+
+dlookr::overview(no_cent_subset_df)
+dlookr::plot_correlate(no_cent_subset_df)
+```
+
+
+
+```{r}
+##simple linear regression to predict nh4 load with no centrate
+
+
+
+no_cent_subset_df_SC<-scale(no_cent_subset_df)
+
+
+no_cent_subset_df$dummy<-.indexmin(no_cent_subset)/100+.indexhour(no_cent_subset)
+
+no_cent_subset_df_2<-no_cent_subset_df[,c(13,15,16, 23,25,20)]
+
+dlookr::plot_qq_numeric(no_cent_subset_df_2)
+
+
+
+
+no_cent_subset_df_2_sc<-as.data.frame(scale(no_cent_subset_df_2))
+no_cent_subset_df_2$nh4_load
+
+fit <- lm(nh4_load ~RAS_m3_d + Storm.flow_3pg_m3d + FFT_flow_m3d + RAS_filet+ dummy+Storm.flow_3pg_m3d  , data=no_cent_subset_df_2_sc)
+
+anova(fit)
+summary(fit)
+
+
+
+plot(no_cent_subset_df_2_sc$nh4_load, col="red", type="l")
+
+lines(fit$fitted.values)
+
+dlookr::overview(no_cent_subset_df_2)
+
+dlookr::plot_correlate(no_cent_subset_df)
+```
+
+
+```{r}
+## Univariate plots
+ggplot(no_cent_subset_df_2, aes(x= nh4_load))+
+  geom_histogram(aes(y= ..density..),
+                 fill= "grey", colour= "black",
+                 binwidth = 1)+
+  geom_density(alpha=.2, fill="blue")
+ ggtitle("Histogram and density plot of NH4 load")
+ 
+ggplot(no_cent_subset_df_2, aes(x= RAS_m3_d))+
+  geom_histogram(aes(y= ..density..),
+                 fill= "grey", colour= "red",
+                 binwidth = 60)+
+  geom_density(alpha=.2, fill="blue")
+ ggtitle("Histogram and density plot of Return Activated sludge flow")
+  
+ ggplot(no_cent_subset_df_2, aes(x= Storm.flow_3pg_m3d))+
+  geom_histogram(aes(y= ..density..),
+                 fill= "grey", colour= "green",
+                 binwidth = 40)+
+  geom_density(alpha=.2, fill="blue")
+ ggtitle("Histogram and density plot of flow rate to storm")
+ 
+```
+
+
+```{r}
+### Bi-Variate plots
+
+ggplot(no_cent_subset_df_2, aes(x= RAS_m3_d,
+                     y= nh4_load))+
+  geom_point(colour = "red")+
+          
+  geom_smooth(method= "loess",           
+  )+
+  labs( x= "RAS_m3_d, m3/day",
+        y= "nh4_load, mg/day",
+        title = "NH4 load Vrs RAS flow")
+
+ggplot(no_cent_subset_df_2, aes(x= FFT_flow_m3d,
+                     y= nh4_load))+
+  geom_point(colour = "red")+
+          
+  geom_smooth(method= "loess",           
+  )+
+  labs( x= "FFT_flow_m3d, m3/day",
+        y= "nh4_load, mg/day",
+        title = "NH4 load Vrs FFT")
+
+ggplot(no_cent_subset_df_2, aes(x= Storm.flow_3pg_m3d,
+                     y= nh4_load))+
+  geom_point(colour = "red")+
+          
+  geom_smooth(method= "loess",           
+  )+
+  labs( x= "Storm.flow_3pg_m3d, m3/day",
+        y= "nh4_load, mg/day",
+        title = "NH4 load Vrs Storm Return flow")
+
+ggplot(no_cent_subset_df_2, aes(x= dummy,
+                     y= nh4_load))+
+  geom_point(colour = "red")+
+          
+  geom_smooth(method= "loess",           
+  )+
+  labs( x= "dummy, m3/day",
+        y= "nh4_load, mg/day",
+        title = "NH4 load Vrs dummy")
+```
+
+
+
+
+```{r}
+#periods with centrate - check
+
+low_cent<-NULL
+for (i in 1:336){
+  df<-(daily_list[[i]])
+  sumcent<-sum(df$Centrate_flow, na.rm=TRUE)
+  if(sumcent<600&sumcent>10){
+    low_cent<-rbind(low_cent, df)
+  }
+  df<-NULL
+}
+
+
+
+low_cent$RAS_m3_d<-low_cent$RAS_flow*60*60*24/1000/3
+
+low_cent$Storm_ret_flow_m3d<-low_cent$Storm_ret_flow*60*60*24/1000
+low_cent$Storm.flow_3pg_m3d<-low_cent$Storm.flow_3pg*60*60*24*0.33/1000/3
+low_cent$FFT_flow_m3d<-low_cent$FFT_flow*1000*0.33/3
+low_cent$Ras_ind<-(low_cent$RAS_m3_d-low_cent$FFT_flow_m3d-low_cent$Storm.flow_3pg_m3d)/(low_cent$FFT_flow_m3d+low_cent$Storm.flow_3pg_m3d)
+low_cent$SAS_F_flow_m3d<-low_cent$SAS_F_flow*60*60*24/1000/3
+low_cent$SAS_F_density_mgl<-low_cent$SAS_F_density*10000
+low_cent$nh4_load<-low_cent$RAS_m3_d*low_cent$amm_in/1000
+
+low_cent$centr_m3d<-low_cent$Centrate_flow*60*60*24/1000/3
+low_cent$ras_real<-(low_cent$RAS_m3_d-low_cent$FFT_flow_m3d-low_cent$Storm.flow_3pg_m3d-low_cent$centr_m3d)
+
+low_cent$dummy<-.indexmin(low_cent)/100+.indexhour(low_cent)
+low_cent$nh4_centr_load<-low_cent$centr_m3d*350/1000
+
+
+View(low_cent)
+```
+
+
+
+```{r}
+# smooth RAS
+
+ras_filt_low_cent<-as.data.frame((rollmean(rollmean(low_cent$ras_real, 5), 5)))
+
+
+
+ras_filt_low_cent<-as.matrix(ras_filt_low_cent)
+rownames(ras_filt_low_cent)<-NULL
+
+add<-as.matrix(c(0,0,0,0))
+
+colnames(add)<-c("ras_filt")
+
+ras_filt_low_cent<-rbind(add,ras_filt_low_cent)
+ras_filt_low_cent<-rbind(ras_filt_low_cent,add)
+
+
+ras_filt_low_cent<-as.matrix(ras_filt_low_cent)
+rownames(ras_filt_low_cent)<-NULL
+
+
+low_cent$RAS_filet<-ras_filt_low_cent[,1]
+
+
+```
+
+
+
+```{r}
+#### Use linear regression model and estimated centrate load (low_cent$nh4_centr_load) to predict influent ammonia load
+
+low_cent$nh4_est_load<-low_cent$FFT_flow_m3d*0.1814383 +low_cent$RAS_filet*0.6247687+low_cent$dummy*0.1087545+
+  low_cent$Storm.flow_3pg_m3d*( -0.0498672 )+ 0.0008042 
+
+
+low_cent_sc<-scale(low_cent)
+low_cent_sc$nh4_est_load<-low_cent_sc$FFT_flow_m3d*0.1814383 +low_cent_sc$RAS_filet*0.6247687+low_cent_sc$dummy*0.1087545+
+  low_cent_sc$Storm.flow_3pg_m3d*( -0.0498672 )+ 0.0008042 
+
+
+low_cent_df<-as.data.frame(low_cent)
+
+low_cent_sc_df<-as.data.frame(low_cent_sc)
+
+low_cent_sc_df$nh4_all_est<-low_cent_sc_df$nh4_est_load+low_cent_sc_df$nh4_centr_load
+
+plot(low_cent_sc_df$nh4_load[1:5000], type="l")
+lines(low_cent_sc_df$nh4_all_est, col="red")
+
+plot(low_cent_sc_df$RAS_filet[1:5000], type="l")
+```
+
+
+
+### Preparation for ANN Model
+
+```{r}
+#Remove NA's from dataset
+no_cent_subset_df_2_sc<-na.omit(no_cent_subset_df_2_sc)
+
+
+dlookr::plot_correlate(no_cent_subset_df_2_sc)
+dlookr::plot_box_numeric(no_cent_subset_df_2_sc)
+dlookr::univar_numeric(no_cent_subset_df_2_sc)
+dlookr::overview(no_cent_subset_df_2_sc)
+```
+
+
+#### Principal Component Analysis{#Principal_Component_Analysis}
+```{r}
+# perform PCA on the Spernal dataset with no centrate
+#   note: variables are centered and scaled before analysis
+pc_no_cent_subset_df_2_sc <- prcomp(no_cent_subset_df_2_sc, center = T, scale. = T)
+
+# inspect the attributes of the PCA object returned by prcomp
+attributes(no_cent_subset_df_2_sc)
+# see value section of the help for the prcomp for more details
+help(prcomp)
+```
+
+
+#### Computing the Mean and Standard deviations of the variables used for scaling prior to PCA
+```{r}
+pc_no_cent_subset_df_2_sc$center
+pc_no_cent_subset_df_2_sc$scale
+```
+
+
+#### Computing the principal component loadings
+```{r}
+pc_no_cent_subset_df_2_sc$rotation
+```
+
+
+#### Computing the pricipal component score vectors
+```{r}
+dim(pc_no_cent_subset_df_2_sc$x)
+```
+
+
+#### A plot of the first 2 principal components
+```{r}
+biplot(pc_no_cent_subset_df_2_sc, scale = 0)
+```
+
+
+#### Reproduce Biplot with a sign change
+```{r}
+pc_no_cent_subset_df_2_sc$rotation<- -pc_no_cent_subset_df_2_sc$rotation
+pc_no_cent_subset_df_2_sc$x<- -pc_no_cent_subset_df_2_sc$x
+biplot(pc_no_cent_subset_df_2_sc, scale = 0)
+```
+
+
+#### Computing the standard deviation of each principal component
+```{r}
+pc_no_cent_subset_df_2_sc$sdev
+```
+
+
+#### Computing the variance explained by each principal component
+```{r}
+pc_no_cent_subset_df_2_sc_var<-(pc_no_cent_subset_df_2_sc$sdev)^2
+pc_no_cent_subset_df_2_sc_var
+```
+
+
+#### Compute the proportion of variance explained by each principal component
+```{r}
+pc_no_cent_subset_df_2_sc_PEV <- pc_no_cent_subset_df_2_sc_var / sum(pc_no_cent_subset_df_2_sc_var)
+
+pc_no_cent_subset_df_2_sc_PEV
+```
+
+
+#### Plot of PEV explained by each component as well as the cummulative PVE
+```{r}
+plot(pc_no_cent_subset_df_2_sc_PEV, xlab= "Principal Component", ylab= "Proportion of Variance Explained", ylim= c(0,1), type='b')
+
+plot(cumsum(pc_no_cent_subset_df_2_sc_PEV), xlab= "Principal Component",ylab= "Cummulative Proportion of Variance Explained", ylim= c(0,1), type='b')
+```
+
+
+
+#### Visual analysis of PCA results{#Visual_analysis_PCA}
+```{r}
+# calculate the proportion of exaplained variance (PEV) from the std values
+pc_no_cent_subset_df_2_sc_var <- pc_no_cent_subset_df_2_sc$sdev^2
+pc_no_cent_subset_df_2_sc_var
+pc_no_cent_subset_df_2_sc_PEV <- pc_no_cent_subset_df_2_sc_var / sum(pc_no_cent_subset_df_2_sc_var)
+pc_no_cent_subset_df_2_sc_PEV
+
+# plot the variance per PC
+#   note: this can be done using the plot function on the prcomp object
+plot(pc_no_cent_subset_df_2_sc)
+
+# plot the cumulative value of PEV for increasing number of additional PCs
+#   note: add an 80% threshold line to inform the feature extraction
+#     according to the plot the first 3 PCs should be selected
+opar <- par()
+plot(
+  cumsum(pc_no_cent_subset_df_2_sc_PEV),
+  ylim = c(0,1),
+  xlab = 'PC',
+  ylab = 'cumulative PEV',
+  pch = 20,
+  col = 'orange'
+)
+abline(h = 0.8, col = 'red', lty = 'dashed')
+par(opar)
+
+# get and inspect the loadings for each PC
+#   note: loadings are reported as a rotation matrix
+pc_no_cent_subset_df_2_sc_loadings <- pc_no_cent_subset_df_2_sc$rotation
+pc_no_cent_subset_df_2_sc_loadings
+
+# plot the loadings for the first three PCs as a barplot
+#   note: two vectors for colours and labels are created for convenience
+#     for details on the other parameters see the help for barplot and legend
+opar <- par()
+colvector = c('red', 'orange', 'yellow', 'green', 'cyan', 'blue')
+labvector = c('PC1', 'PC2', 'PC3')
+barplot(
+  pc_no_cent_subset_df_2_sc_loadings[,c(1:3)],
+  beside = T,
+  yaxt = 'n',
+  names.arg = labvector,
+  col = colvector,
+  ylim = c(-1,1),
+  border = 'white',
+  ylab = 'loadings'
+)
+axis(2, seq(-1,1,0.1))
+legend(
+  'bottomright',
+  bty = 'n',
+  col = colvector,
+  pch = 15,
+  row.names(pc_no_cent_subset_df_2_sc_loadings)
+)
+par(opar)
+
+# generate a biplot for each pair of important PCs (and show them on the same page)
+#   note: the option choices is used to select the PCs - default is 1:2
+opar = par()
+par(mfrow = c(2,2))
+biplot(
+  pc_no_cent_subset_df_2_sc,
+  scale = 0,
+  col = c('grey40','orange')
+)
+biplot(
+  pc_no_cent_subset_df_2_sc,
+  choices = c(1,3),
+  scale = 0,
+  col = c('grey40','orange')
+)
+biplot(
+  pc_no_cent_subset_df_2_sc,
+  choices = c(2,3),
+  scale = 0,
+  col = c('grey40','orange')
+)
+par(opar)
+
+# the space of the first three PCs is better explored interactively...
+#   ...using a function from the pca3d package
+# first install pca3d
+if(require(pca3d) == FALSE){
+    install.packages('pca3d')
+}
+# then plot and explore the data by rotating/zoom with the mouse
+#pca3d::pca3d(pc_no_cent_subset_df_2_sc, show.labels = T)
+
+# and save a snapshot of the view in png format
+#pca3d::snapshotPCA3d('pc_no_cent_subset_df_2_sc_3D.png')
+```
+
+```{r}
+str(no_cent_subset_df_2_sc)
+```
+
+
+
+
+
+### Data Preparation For Neural Network Regression Type Problem
+```{r}
+###  transform the data using a min-max function
+###   first define a MinMax function
+MinMax <- function(x){
+  tx <- (x - min(x)) / (max(x) - min(x))
+  return(tx)
+}
+### then apply the function to each column of the data set (except for nh4_load)
+###   note: remove the nh4_load column first and then add it again after transformation
+###    and then cast the apply output to a data frame
+no_cent_subset_df_2_sc_minmax <-no_cent_subset_df_2_sc[,-6]
+no_cent_subset_df_2_sc_minmax <- apply(no_cent_subset_df_2_sc_minmax, 2, MinMax)
+no_cent_subset_df_2_sc_minmax <- as.data.frame(no_cent_subset_df_2_sc_minmax)
+no_cent_subset_df_2_sc_minmax$nh4_load <- no_cent_subset_df_2_sc$nh4_load
+
+### create a 70/30 training/test set split
+n_rows <- nrow(no_cent_subset_df_2_sc_minmax)
+training_idx <- sample(n_rows, n_rows * 0.7)
+training_no_cent_subset_df_2_sc_minmax <-no_cent_subset_df_2_sc_minmax[training_idx,]
+test_no_cent_subset_df_2_sc_minmax <- no_cent_subset_df_2_sc_minmax[-training_idx,]
+
+```
+
+
+####  Neural network training Regression Type Problem
+
+```{r}
+###  define a formula for predicting nh4_load
+NH4_load_formula = nh4_load ~RAS_m3_d + Storm.flow_3pg_m3d + FFT_flow_m3d + RAS_filet  + dummy 
+
+
+###  train a neural network with 1 hidden nodes
+no_cent_subset_df_2_sc_nn_1 <- neuralnet(NH4_load_formula, hidden = 1, data = training_no_cent_subset_df_2_sc_minmax)
+
+###  train a neural network with 2 hidden nodes
+no_cent_subset_df_2_sc_nn_2 <- neuralnet(NH4_load_formula, hidden = 2,  data = training_no_cent_subset_df_2_sc_minmax)
+
+###  train a neural network with 3 hidden nodes
+no_cent_subset_df_2_sc_nn_3 <- neuralnet(NH4_load_formula, hidden = 3,  data = training_no_cent_subset_df_2_sc_minmax)
+
+###  train a neural network with 4 hidden nodes
+no_cent_subset_df_2_sc_nn_4 <- neuralnet(NH4_load_formula, hidden = 4,  data = training_no_cent_subset_df_2_sc_minmax)
+
+
+
+### Plot the four neural networks and compare their structure
+plot(no_cent_subset_df_2_sc_nn_1)
+plot(no_cent_subset_df_2_sc_nn_2)
+plot(no_cent_subset_df_2_sc_nn_3)
+plot(no_cent_subset_df_2_sc_nn_4)
+
+```
+
+
+
+####  Neural network prediction{#Neural_network_prediction}
+```{r}
+# compute the prediction for each neural network
+#   note: the nh4_load attribute (column 6) is excluded from the test data set
+
+pred_no_cent_subset_df_2_sc_nn_1<-neuralnet::compute(no_cent_subset_df_2_sc_nn_1, test_no_cent_subset_df_2_sc_minmax [,-6])
+pred_no_cent_subset_df_2_sc_nn_1
+pred_no_cent_subset_df_2_sc_nn_2<-neuralnet::compute(no_cent_subset_df_2_sc_nn_2, test_no_cent_subset_df_2_sc_minmax [,-6])
+pred_no_cent_subset_df_2_sc_nn_3<-neuralnet::compute(no_cent_subset_df_2_sc_nn_3, test_no_cent_subset_df_2_sc_minmax [,-6])
+pred_no_cent_subset_df_2_sc_nn_4<-neuralnet::compute(no_cent_subset_df_2_sc_nn_4, test_no_cent_subset_df_2_sc_minmax [,-6]) 
+```
+
+
+
+
+
+```{r}
+# create a table with actual values and the 4 predictions
+#   note: predicted values are stored as net_result attribute of the prediction object
+NH4_load_results <- data.frame(
+  actual = test_no_cent_subset_df_2_sc_minmax$nh4_load,
+  nn_1 = pred_no_cent_subset_df_2_sc_nn_1$net.result,
+  nn_2 = pred_no_cent_subset_df_2_sc_nn_2$net.result,
+  nn_3 = pred_no_cent_subset_df_2_sc_nn_3$net.result,
+  nn_4 = pred_no_cent_subset_df_2_sc_nn_4$net.result
+  
+)
+
+# calculate the correlation between actual and predicted values to identify the best predictor
+cor(NH4_load_results[,'actual'], NH4_load_results[,c("nn_1","nn_2","nn_3","nn_4")])
+
+# plot actual vs predicted values for the worst (blue) and best predictor (orange)
+#   note: points is used to add points on a graph
+plot(
+  NH4_load_results$actual,
+  NH4_load_results$nn_1,
+  col = 'blue',
+  xlab = 'actual nh4_load',
+  ylab = 'predicted nh4_load',
+  xlim = c(-2,4),
+  ylim = c(-2,4)
+)
+points(
+  NH4_load_results$actual,
+  NH4_load_results$nn_4,
+  col = 'orange'
+)
+abline(a = 0, b = 1, col = 'red', lty = 'dashed')
+legend(
+  'topleft',
+  c('nn_1', 'nn_4'),
+  pch = 1,
+  col = c('blue', 'orange'),
+  bty = 'n'
+)
+
+dlookr::plot_correlate(NH4_load_results)
+```
+
+
