@@ -33,6 +33,7 @@ library(class)
 library(dlookr)
 library(dplyr)
 library(ggplot2)
+library(Metrics)
 
 ```
 
@@ -665,6 +666,26 @@ NH4_load_results <- data.frame(
 
 # calculate the correlation between actual and predicted values to identify the best predictor
 cor(NH4_load_results[,'actual'], NH4_load_results[,c("nn_1","nn_2","nn_3","nn_4")])
+
+rmse(NH4_load_results$actual,  NH4_load_results$nn_1)
+rmse(NH4_load_results$actual,  NH4_load_results$nn_2)
+rmse(NH4_load_results$actual,  NH4_load_results$nn_3)
+rmse(NH4_load_results$actual,  NH4_load_results$nn_4)
+
+mse(NH4_load_results$actual,  NH4_load_results$nn_1)
+mse(NH4_load_results$actual,  NH4_load_results$nn_2)
+mse(NH4_load_results$actual,  NH4_load_results$nn_3)
+mse(NH4_load_results$actual,  NH4_load_results$nn_4)
+
+mae(NH4_load_results$actual,  NH4_load_results$nn_1)
+mae(NH4_load_results$actual,  NH4_load_results$nn_2)
+mae(NH4_load_results$actual,  NH4_load_results$nn_3)
+mae(NH4_load_results$actual,  NH4_load_results$nn_4)
+
+mape(NH4_load_results$actual,  NH4_load_results$nn_1)
+mape(NH4_load_results$actual,  NH4_load_results$nn_2)
+mape(NH4_load_results$actual,  NH4_load_results$nn_3)
+mape(NH4_load_results$actual,  NH4_load_results$nn_4)
 
 # plot actual vs predicted values for the worst (blue) and best predictor (orange)
 #   note: points is used to add points on a graph
